@@ -1,5 +1,5 @@
 use std::{io::{stdout, Write, Stdout}, time::Duration, env, fs, cmp::min};
-use crossterm::{cursor, event::{self, Event, KeyEvent, KeyCode, KeyModifiers, KeyEventKind}, execute, queue, style, terminal::{self, ClearType}, Result};
+use crossterm::{cursor, event::{self, Event, KeyEvent, KeyCode, KeyModifiers, KeyEventKind}, execute, queue, style::{self, SetForegroundColor, Color, ResetColor}, terminal::{self, ClearType}, Result};
 
 macro_rules! prompt {
     ($editor:expr,$message:expr,$default:expr $(, $callback:expr)?) => {{
@@ -24,8 +24,8 @@ macro_rules! prompt {
                 }
                 _ => {}
             }
-            if let KeyEvent{code: c, kind: KeyEventKind::Press, ..} = event {
-                $($callback(editor, &input, c);)?   
+            if let KeyEvent{code: _key_code, kind: KeyEventKind::Press, ..} = event {
+                $($callback(editor, &input, _key_code);)?   
             }
         }
         if input.len() > 0 {
@@ -46,28 +46,157 @@ fn read_key() -> std::io::Result<KeyEvent> {
     }
 }
 
-struct TextField {
-    cursor_x: u16,
-    cursor_y: u16,
+#[derive(Clone)]
+struct Cursor{
+    x: u16,
+    y: u16,
     render_x: u16,
     x_offset: u16,
     y_offset: u16,
     size: (u16, u16),
+}
+
+impl Cursor {
+    fn new(size: (u16, u16)) -> Self {
+        Self{x: 0, y: 0, render_x:0, x_offset: 0, y_offset: 0, size: size}
+    }
+
+    fn move_cursor(&mut self, lines: &Vec<String>, direction: KeyCode) {
+        let num_lines = lines.len() as u16;
+        let current_len = |y| lines[y as usize].len() as u16;
+        match direction {
+            KeyCode::Up => {
+                if self.y > 0 {
+                    self.y -= 1;
+                    self.render_x = min(self.x, current_len(self.y))
+                }
+            }
+            KeyCode::Right => {
+                self.x = self.render_x;
+                if self.x < current_len(self.y) {
+                    self.x += 1;
+                }else if self.y < num_lines - 1 {
+                    self.y += 1;
+                    self.x = 0;
+                }
+                self.render_x = self.x;
+            }
+            KeyCode::Down => {
+                if self.y < num_lines as u16 - 1 {
+                    self.y += 1;
+                    self.render_x = min(self.x, current_len(self.y))
+                }
+            }
+            KeyCode::Left => {
+                self.x = self.render_x;
+                if self.x > 0 {
+                    self.x -= 1;
+                }else if self.y > 0 {
+                    self.y -= 1;
+                    self.x = current_len(self.y);
+                }
+                self.render_x = self.x;
+            }
+            _ => {}
+        }
+    }
+
+    fn change_offset(&mut self) {
+        if self.y < self.y_offset{   // Up
+            self.y_offset -= self.y_offset - self.y;
+        }
+        if self.x > self.size.0 + self.x_offset - 1{     // Right
+            self.x_offset += self.x - (self.size.0 + self.x_offset - 1);
+        }
+        if self.y > self.size.1 + self.y_offset - 1{ // Down
+            self.y_offset += self.y - (self.size.1 + self.y_offset - 1);
+        }
+        if self.x < self.x_offset{   // Left
+            self.x_offset -= self.x_offset - self.x;
+        }
+    }
+
+    fn get_position(&self) -> (u16, u16) {
+        (self.render_x, self.y)
+    }
+
+    fn set_position(&mut self, x: u16, y: u16) {
+        self.x = x;
+        self.render_x = x;
+        self.y = y;
+    }
+
+    fn get_offset(&self) -> (u16, u16) {
+        (self.x_offset, self.y_offset)
+    }
+
+    fn get_line_index(&self) -> usize {
+        self.y as usize
+    }
+}
+
+struct SearchData {
+    results: Vec<(u16,u16)>,
+    index: usize,
+}
+
+impl SearchData {
+    fn new() -> Self {
+        Self{results: Vec::new(), index:0 }
+    }
+
+    fn find_results(&mut self, phrase: &String, lines: &Vec<String>) -> Option<(u16, u16)> {
+        self.results.clear();
+        if phrase.len() == 0 { return None; }
+        for row in 0..lines.len() {
+            let mut start = 0;
+            while let Some(result) = lines[row][start..].find(phrase) {
+                let col = start + result;
+                self.results.push((col as u16, row as u16));
+                start = col + phrase.len();
+            }
+        }
+        if self.results.len() > 0 {
+            Some(self.results[0])
+        } else {
+            None
+        }
+    }
+
+    fn get_next(&mut self) -> Option<(u16, u16)> {
+        if self.results.len() == 0 {
+            None
+        }else{
+            self.index = (self.index + 1) % self.results.len();
+            Some(self.results[self.index])
+        }
+    }
+
+    fn get_previous(&mut self) -> Option<(u16, u16)> {
+        if self.results.len() == 0 {
+            None
+        }else{
+            self.index = (self.index + self.results.len() - 1) % self.results.len();
+            Some(self.results[self.index])
+        }
+    }
+}
+
+struct TextField {
+    size: (u16, u16),
     lines: Vec<String>,
     dirty: bool,
+    cursor: Cursor,
+    search_data: SearchData
 }
 
 impl TextField {
     fn new(size: (u16, u16)) -> Self {
-        Self{cursor_x: 0, cursor_y: 0, render_x: 0, x_offset: 0, y_offset: 0, size: size, lines: vec![String::new()], dirty: true}
+        Self{size: size, lines: vec![String::new()], dirty: true, cursor: Cursor::new(size.clone()), search_data: SearchData::new()}
     }
 
     fn load(&mut self, file_name: &String) {
-        self.cursor_x = 0;
-        self.cursor_y = 0;
-        self.render_x = 0;
-        self.x_offset = 0;
-        self.y_offset = 0;
+        self.cursor.set_position(0, 0);
         self.dirty = false;
         let file_contents = fs::read_to_string(&file_name);
         self.lines = match file_contents {
@@ -90,136 +219,96 @@ impl TextField {
     }
 
     fn print_line(&self, w: &mut Stdout, y: usize) -> std::io::Result<()> {
-        let line_index = y + self.y_offset as usize;
+        let (x_offset, y_offset) = self.cursor.get_offset();
+        let line_index = y + y_offset as usize;
         if line_index < self.lines.len() {
+            queue!(w, cursor::MoveTo(2, 2 + y as u16))?;
             let full_line = &self.lines[line_index];
-            let start = min(self.x_offset as usize, full_line.len());
-            let end = min((self.x_offset + self.size.0) as usize , full_line.len());
+            let start = min(x_offset as usize, full_line.len());
+            let end = min((x_offset + self.size.0) as usize , full_line.len());
             let segment = &full_line[start..end];
-            queue!(w, cursor::MoveTo(2, 2 + y as u16), style::Print(segment))?;       
+            for c in segment.chars(){
+                if c.is_digit(10) {
+                    queue!(w, SetForegroundColor(Color::Cyan), style::Print(c), ResetColor)?;
+                }else{
+                    queue!(w, style::Print(c))?;
+                }
+            }
         }
         Ok(())
     }
 
     fn get_cursor_position(&self) -> (u16, u16) {
-        (self.render_x + 2 - self.x_offset, self.cursor_y + 2 - self.y_offset)
-    }
-    
-    fn current_line_len(&self) -> u16{
-        self.lines[self.cursor_y as usize].len() as u16
-    }
-
-    fn change_offset(&mut self) {
-        if self.cursor_y < self.y_offset{   // Up
-            self.y_offset -= self.y_offset - self.cursor_y;
-        }
-        if self.render_x > self.size.0 + self.x_offset - 1{     // Right
-            self.x_offset += self.render_x - (self.size.0 + self.x_offset - 1);
-        }
-        if self.cursor_y > self.size.1 + self.y_offset - 1{ // Down
-            self.y_offset += self.cursor_y - (self.size.1 + self.y_offset - 1);
-        }
-        if self.render_x < self.x_offset{   // Left
-            self.x_offset -= self.x_offset - self.render_x;
-        }
+        let (x, y) = self.cursor.get_position();
+        let (x_offset, y_offset) = self.cursor.get_offset();
+        (x + 2 - x_offset, y + 2 - y_offset)
     }
 
     fn move_cursor(&mut self, direction: KeyCode) {
-        match direction {
-            KeyCode::Up => {
-                if self.cursor_y > 0 {
-                    self.cursor_y -= 1;
-                    self.render_x = min(self.cursor_x, self.current_line_len())
-                }
-            }
-            KeyCode::Right => {
-                self.cursor_x = self.render_x;
-                if self.cursor_x < self.current_line_len() {
-                    self.cursor_x += 1;
-                }else if self.cursor_y < self.lines.len() as u16 - 1 {
-                    self.cursor_y += 1;
-                    self.cursor_x = 0;
-                }
-                self.render_x = self.cursor_x;
-            }
-            KeyCode::Down => {
-                if self.cursor_y < self.lines.len() as u16 - 1 {
-                    self.cursor_y += 1;
-                    self.render_x = min(self.cursor_x, self.current_line_len())
-                }
-            }
-            KeyCode::Left => {
-                self.cursor_x = self.render_x;
-                if self.cursor_x > 0 {
-                    self.cursor_x -= 1;
-                }else if self.cursor_y > 0 {
-                    self.cursor_y -= 1;
-                    self.cursor_x = self.current_line_len();
-                }
-                self.render_x = self.cursor_x;
-            }
-            _ => {}
-        }
-        self.change_offset();
+        let cursor = &mut self.cursor;
+        cursor.move_cursor(&self.lines, direction);
+        self.cursor.change_offset();
     }
 
     fn find_phrase(&mut self, phrase: &String, key_code: KeyCode) {
-        match key_code {
+        let position = match key_code {
             KeyCode::Char(_) | KeyCode::Backspace => {
-                for row in 0..self.lines.len() {
-                    if let Some(index) = self.lines[row].find(phrase) {
-                        self.cursor_y = row as u16;
-                        self.cursor_x = index as u16;
-                        self.render_x = index as u16;
-                        self.change_offset();
-                        break;
-                    }
-                }
+                self.search_data.find_results(phrase, &self.lines)
             },
-            _ => {}
+            KeyCode::Right => {
+                self.search_data.get_next()
+            },
+            KeyCode::Left => {
+                self.search_data.get_previous()
+            }
+            _ => None
+        };
+        if let Some((x, y)) = position {
+            self.cursor.set_position(x, y);
+            self.cursor.change_offset();
         }
     }
 
     fn insert_char(&mut self, c: char) {
+        let line_index = self.cursor.get_line_index();
+        let (x, y) = self.cursor.get_position();
         match c{
             '\t' => {
-                self.lines[self.cursor_y as usize].insert_str(self.render_x as usize, "    ");
-                self.cursor_x = self.render_x + 4;
+                self.lines[line_index].insert_str(x as usize, "    ");
+                self.cursor.set_position(x + 4, y)
             }
             _ => {
-                self.lines[self.cursor_y as usize].insert(self.render_x as usize, c);
-                self.cursor_x = self.render_x + 1;
+                self.lines[line_index].insert(x as usize, c);
+                self.cursor.set_position(x + 1, y)
             }
         }
-        self.render_x = self.cursor_x;
         self.dirty = true;
     }
 
     fn new_line(&mut self) {
-        let line_index = self.cursor_y as usize;
-        let (old, new) = self.lines[line_index].split_at(self.render_x as usize).clone();
+        let line_index = self.cursor.get_line_index();
+        let (x, y) = self.cursor.get_position();
+        let (old, new) = self.lines[line_index].split_at(x as usize).clone();
         let (old, new) = (String::from(old), String::from(new));
         self.lines[line_index] = String::from(old);
         self.lines.insert(line_index + 1, String::from(new));
-        self.cursor_y += 1;
-        self.cursor_x = 0;
-        self.render_x = 0;
+        self.cursor.set_position(0, y + 1);
         self.dirty = true;
     }
 
     fn delete_char(&mut self) {
-        let line_index = self.cursor_y as usize;
-        if self.render_x > 0 {
-            self.lines[line_index].remove(self.render_x as usize - 1);
-            self.cursor_x = self.render_x - 1;
-        }else if self.cursor_y > 0 {
-            let current_line = self.lines[self.cursor_y as usize].clone();
-            self.cursor_x = self.lines[line_index - 1].len() as u16;
+        let line_index = self.cursor.get_line_index();
+        let (x, y) = self.cursor.get_position();
+        if x > 0 {
+            self.lines[line_index].remove(x as usize - 1);
+            self.cursor.set_position(x - 1, y);
+        }else if y > 0 {
+            let current_line = self.lines[line_index].clone();
+            let old_length = self.lines[line_index - 1].len(); 
             self.lines[line_index - 1].push_str(&current_line.as_str());
             self.lines.remove(line_index);
-            self.cursor_y -= 1;
+            self.cursor.set_position(old_length as u16, y-1);
         }
-        self.render_x = self.cursor_x;
         self.dirty = true;
     }
 
@@ -234,7 +323,8 @@ struct Editor {
     w: Stdout,
     file_name: Option<String>,
     text_field: TextField,
-    status_message: Option<String>
+    status_message: Option<String>,
+    search_phrase: String,
 }
 
 impl Editor{
@@ -246,7 +336,7 @@ impl Editor{
         if let Some(name) = &file_name {
             text_field.load(name);
         }
-        Self { running: true, win_size, w: stdout(), file_name: file_name, text_field: text_field, status_message: None}
+        Self { running: true, win_size, w: stdout(), file_name: file_name, text_field: text_field, status_message: None, search_phrase: String::new()}
     }
 
     fn print_header(&mut self) -> std::io::Result<()> {
@@ -268,8 +358,8 @@ impl Editor{
         match &self.status_message {
             Some(string) => string.clone(),
             None => {
-                format!("Cursor: {}, {} -- {} lines",
-                self.text_field.cursor_x, self.text_field.cursor_y, self.text_field.lines.len())
+                let (x, y) = self.text_field.cursor.get_position();
+                format!("Cursor: {}, {} -- {} lines", x, y, self.text_field.lines.len())
             }
         }
     }
@@ -323,7 +413,13 @@ impl Editor{
     }
 
     fn find(&mut self) -> std::io::Result<()> {
-        let _ = prompt!(self, "Find:", String::with_capacity(32), Editor::find_phrase);
+        let previous_cursor = self.text_field.cursor.clone();
+        let default_search = self.search_phrase.clone();
+        let phrase = prompt!(self, "Find:", default_search, Editor::find_phrase);
+        match phrase {
+            Some(phrase) => self.search_phrase = phrase,
+            None => self.text_field.cursor = previous_cursor,
+        }
         Ok(())
     }
 
