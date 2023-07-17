@@ -1,5 +1,5 @@
 use std::{io::{stdout, Write, Stdout}, time::Duration, env, fs, cmp::min};
-use crossterm::{cursor, event::{self, Event, KeyEvent, KeyCode, KeyModifiers, KeyEventKind}, execute, queue, style::{self, SetForegroundColor, Color, ResetColor}, terminal::{self, ClearType}, Result};
+use crossterm::{cursor, event::{self, Event, KeyEvent, KeyCode, KeyModifiers, KeyEventKind}, execute, queue, style::{self, Color, SetForegroundColor}, terminal::{self, ClearType}, Result};
 
 macro_rules! prompt {
     ($editor:expr,$message:expr,$default:expr $(, $callback:expr)?) => {{
@@ -61,30 +61,28 @@ impl Cursor {
         Self{x: 0, y: 0, render_x:0, x_offset: 0, y_offset: 0, size: size}
     }
 
-    fn move_cursor(&mut self, lines: &Vec<String>, direction: KeyCode) {
-        let num_lines = lines.len() as u16;
-        let current_len = |y| lines[y as usize].len() as u16;
+    fn move_cursor(&mut self, text: &Text, direction: KeyCode) {
         match direction {
             KeyCode::Up => {
                 if self.y > 0 {
                     self.y -= 1;
-                    self.render_x = min(self.x, current_len(self.y))
+                    self.render_x = min(self.x, text.line_len(self.y as usize) as u16);
                 }
             }
             KeyCode::Right => {
                 self.x = self.render_x;
-                if self.x < current_len(self.y) {
+                if self.x < text.line_len(self.y as usize) as u16 {
                     self.x += 1;
-                }else if self.y < num_lines - 1 {
+                }else if self.y < text.len() as u16 - 1 {
                     self.y += 1;
                     self.x = 0;
                 }
                 self.render_x = self.x;
             }
             KeyCode::Down => {
-                if self.y < num_lines as u16 - 1 {
+                if self.y < text.len() as u16 - 1 {
                     self.y += 1;
-                    self.render_x = min(self.x, current_len(self.y))
+                    self.render_x = min(self.x, text.line_len(self.y as usize) as u16)
                 }
             }
             KeyCode::Left => {
@@ -93,7 +91,7 @@ impl Cursor {
                     self.x -= 1;
                 }else if self.y > 0 {
                     self.y -= 1;
-                    self.x = current_len(self.y);
+                    self.x = text.line_len(self.y as usize) as u16;
                 }
                 self.render_x = self.x;
             }
@@ -105,14 +103,14 @@ impl Cursor {
         if self.y < self.y_offset{   // Up
             self.y_offset -= self.y_offset - self.y;
         }
-        if self.x > self.size.0 + self.x_offset - 1{     // Right
-            self.x_offset += self.x - (self.size.0 + self.x_offset - 1);
+        if self.render_x> self.size.0 + self.x_offset - 1{  // Right
+            self.x_offset += self.render_x- (self.size.0 + self.x_offset - 1);
         }
         if self.y > self.size.1 + self.y_offset - 1{ // Down
             self.y_offset += self.y - (self.size.1 + self.y_offset - 1);
         }
-        if self.x < self.x_offset{   // Left
-            self.x_offset -= self.x_offset - self.x;
+        if self.render_x< self.x_offset{   // Left
+            self.x_offset -= self.x_offset - self.render_x;
         }
     }
 
@@ -145,12 +143,12 @@ impl SearchData {
         Self{results: Vec::new(), index:0 }
     }
 
-    fn find_results(&mut self, phrase: &String, lines: &Vec<String>) -> Option<(u16, u16)> {
+    fn find_results(&mut self, phrase: &String, text: &Text) -> Option<(u16, u16)> {
         self.results.clear();
         if phrase.len() == 0 { return None; }
-        for row in 0..lines.len() {
+        for row in 0..text.len() {
             let mut start = 0;
-            while let Some(result) = lines[row][start..].find(phrase) {
+            while let Some(result) = text.find_phrase(phrase, row, start) {
                 let col = start + result;
                 self.results.push((col as u16, row as u16));
                 start = col + phrase.len();
@@ -182,38 +180,230 @@ impl SearchData {
     }
 }
 
+enum HighlightType {
+    Standard, 
+    Number, 
+}
+
+trait SyntaxHighlight {
+    fn update_syntax(&self, line: &mut Line);
+    fn syntax_colour(&self, highlight_type: &HighlightType) -> Color;
+}
+
+struct RustSyntax {
+}
+
+impl SyntaxHighlight for RustSyntax {
+    fn update_syntax(&self, line: &mut Line) {
+        line.highlight_types = Vec::with_capacity(line.len());
+        for c in line.content.chars() {
+            if c.is_digit(10) {
+                line.highlight_types.push(HighlightType::Number);
+            }else{
+                line.highlight_types.push(HighlightType::Standard);
+            }
+        }
+    }
+
+    fn syntax_colour(&self, highlight_type: &HighlightType) -> Color {
+        match highlight_type {
+            HighlightType::Number => Color::Cyan,
+            _ => Color::Reset
+        }
+    }
+}
+
+struct Line {
+    content: String,
+    highlight_types: Vec<HighlightType>,
+}
+
+impl Line {
+    fn new(content: String) -> Self {
+        Self{content: content, highlight_types: Vec::new()}
+    }
+
+    fn blank() -> Self {
+        Self{content: String::new(), highlight_types: Vec::new()}
+    }
+
+    fn insert(&mut self, index: usize, s: &str) {
+        self.content.insert_str(index, s);
+    }
+
+    fn delete_char(&mut self, index: usize) {
+        self.content.remove(index);
+    }
+
+    fn append(&mut self, line: &Line) {
+        self.content.push_str(line.content.as_str());
+    }
+
+    fn split_at(&mut self, index: usize) -> Line {
+        let new_line: String = self.content[index..].into();
+        self.content = self.content[..index].into();
+        Line::new(new_line)
+    }
+
+    fn find_phrase(&self, phrase: &str, start: usize) -> Option<usize> {
+        self.content[start..].find(phrase)
+    }
+
+    fn len(&self) -> usize {
+        self.content.len()
+    }
+
+    fn print(&self, w: &mut Stdout, start: usize, end: usize, highlight: &Option<Box<dyn SyntaxHighlight>>) -> std::io::Result<()> {
+        let start = min(start as usize, self.len());
+        let end = min(end as usize , self.len());
+        for (i, c) in self.content[start..end].chars().enumerate() {
+            let colour = match (highlight, self.highlight_types.get(i)) {
+                (Some(syntax_highlight),Some(highlight_type)) => {
+                    syntax_highlight.syntax_colour(highlight_type)
+                }
+                _ => {
+                    Color::Reset
+                }
+            };
+            queue!(w, SetForegroundColor(colour), style::Print(c))?;
+        }
+        Ok(())
+    }
+}
+
+struct Text {
+    lines: Vec<Line>,
+    syntax_highlight: Option<Box<dyn SyntaxHighlight>>,
+}
+
+impl Text{
+    fn new() -> Self {
+        Self{lines: Vec::new(), syntax_highlight: Some(Box::new(RustSyntax{})) }
+    }
+
+    fn load(&mut self, content: std::io::Result<String>) {
+        self.lines = match content {
+            Ok(contents) => {
+                let mut lines: Vec<Line> = contents.lines().map(|it| Line::new(it.into())).collect();
+                if lines.len() == 0 {lines.push(Line::blank())}
+                lines
+            },
+            _ => vec![Line::blank()]
+        };
+        for line in &mut self.lines {
+            Text::update_line(&self.syntax_highlight, line);
+        }
+    }
+
+    fn update_line(syntax_highlight: &Option<Box<dyn SyntaxHighlight>>, line: &mut Line) {
+        if let Some(highlight) = syntax_highlight {
+            highlight.update_syntax(line);
+        }
+    }
+
+    fn save(&mut self, file_name: &String) -> std::io::Result<()> {
+        let mut file = fs::OpenOptions::new().write(true).create(true).open(file_name)?;
+        let strings: Vec<String> = self.lines.iter().map(|it| it.content.clone()).collect();
+        let contents = strings.join("\n");
+        file.set_len(contents.len() as u64)?;
+        file.write_all(contents.as_bytes())
+    }
+
+    fn print_line(&self, w: &mut Stdout, index: usize, start: u16, end: u16) -> std::io::Result<()> {
+        if index < self.lines.len() {
+            let line = &self.lines[index];
+            line.print(w, start as usize, end as usize, &self.syntax_highlight)?;
+        }
+        Ok(())
+    }
+
+    fn insert_char(&mut self, c: char, cursor: &mut Cursor) {
+        let (x, y) = cursor.get_position();
+        let line = &mut self.lines[cursor.get_line_index()];
+        match c{
+            '\t' => {
+                line.insert(x as usize, "    ");
+                cursor.set_position(x + 4, y)
+            }
+            _ => {
+                line.insert(x as usize, c.to_string().as_str());
+                cursor.set_position(x + 1, y)
+            }
+        }
+        Text::update_line(&self.syntax_highlight, line);
+    }
+
+    fn new_line(&mut self, cursor: &mut Cursor) {
+        let line_index = cursor.get_line_index();
+        let (x,y) = cursor.get_position();
+        let new_line = self.lines[line_index].split_at(x as usize);
+        self.lines.insert(line_index + 1, new_line);
+        Text::update_line(&self.syntax_highlight, &mut self.lines[line_index]);
+        Text::update_line(&self.syntax_highlight, &mut self.lines[line_index + 1]);
+        cursor.set_position(0, y + 1);
+    }
+
+    fn delete_char(&mut self, cursor: &mut Cursor) {
+        let line_index = cursor.get_line_index();
+        let (x, y) = cursor.get_position();
+        if x > 0 {
+            self.lines[line_index].delete_char(x as usize - 1);
+            Text::update_line(&self.syntax_highlight, &mut self.lines[line_index]);
+            cursor.set_position(x - 1, y);
+        }else if y > 0 {
+            let old_line = self.lines.remove(line_index);
+            let old_length = self.lines[line_index-1].len();
+            self.lines[line_index-1].append(&old_line);
+            Text::update_line(&self.syntax_highlight, &mut self.lines[line_index-1]);
+            cursor.set_position(old_length as u16, y-1);
+        }
+    }
+
+    fn find_phrase(&self, phrase: &str, index: usize, start: usize) -> Option<usize> {
+        self.lines[index].find_phrase(phrase, start)
+    }
+
+    fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    fn line_len(&self, index: usize) -> usize {
+        if index < self.len() {
+            self.lines[index].len()
+        } else {
+            0
+        }
+    }
+}
+
 struct TextField {
     size: (u16, u16),
-    lines: Vec<String>,
+    text: Text,
     dirty: bool,
     cursor: Cursor,
-    search_data: SearchData
+    search_data: SearchData,
 }
 
 impl TextField {
     fn new(size: (u16, u16)) -> Self {
-        Self{size: size, lines: vec![String::new()], dirty: true, cursor: Cursor::new(size.clone()), search_data: SearchData::new()}
+        Self{
+            size: size, 
+            text: Text::new(), 
+            dirty: true, 
+            cursor: Cursor::new(size.clone()), 
+            search_data: SearchData::new(),
+        }
     }
 
     fn load(&mut self, file_name: &String) {
         self.cursor.set_position(0, 0);
         self.dirty = false;
         let file_contents = fs::read_to_string(&file_name);
-        self.lines = match file_contents {
-            Ok(contents) => {
-                let mut lines: Vec<String> = contents.lines().map(|it| it.into()).collect();
-                if lines.len() == 0 {lines.push(String::new());}
-                lines
-            },
-            _ => vec![String::new()]
-        }
+        self.text.load(file_contents);
     }
 
     fn save(&mut self, file_name: &String) -> std::io::Result<()>{
-        let mut file = fs::OpenOptions::new().write(true).create(true).open(file_name)?;
-        let contents = self.lines.join("\n");
-        file.set_len(contents.len() as u64)?;
-        file.write_all(contents.as_bytes())?;
+        self.text.save(file_name)?;
         self.dirty = false;
         Ok(())
     }
@@ -221,20 +411,8 @@ impl TextField {
     fn print_line(&self, w: &mut Stdout, y: usize) -> std::io::Result<()> {
         let (x_offset, y_offset) = self.cursor.get_offset();
         let line_index = y + y_offset as usize;
-        if line_index < self.lines.len() {
-            queue!(w, cursor::MoveTo(2, 2 + y as u16))?;
-            let full_line = &self.lines[line_index];
-            let start = min(x_offset as usize, full_line.len());
-            let end = min((x_offset + self.size.0) as usize , full_line.len());
-            let segment = &full_line[start..end];
-            for c in segment.chars(){
-                if c.is_digit(10) {
-                    queue!(w, SetForegroundColor(Color::Cyan), style::Print(c), ResetColor)?;
-                }else{
-                    queue!(w, style::Print(c))?;
-                }
-            }
-        }
+        queue!(w, cursor::MoveTo(2, 2 + y as u16))?;
+        self.text.print_line(w, line_index, x_offset, x_offset + self.size.0)?;
         Ok(())
     }
 
@@ -246,14 +424,14 @@ impl TextField {
 
     fn move_cursor(&mut self, direction: KeyCode) {
         let cursor = &mut self.cursor;
-        cursor.move_cursor(&self.lines, direction);
+        cursor.move_cursor(&self.text, direction);
         self.cursor.change_offset();
     }
 
     fn find_phrase(&mut self, phrase: &String, key_code: KeyCode) {
         let position = match key_code {
             KeyCode::Char(_) | KeyCode::Backspace => {
-                self.search_data.find_results(phrase, &self.lines)
+                self.search_data.find_results(phrase, &self.text)
             },
             KeyCode::Right => {
                 self.search_data.get_next()
@@ -270,45 +448,20 @@ impl TextField {
     }
 
     fn insert_char(&mut self, c: char) {
-        let line_index = self.cursor.get_line_index();
-        let (x, y) = self.cursor.get_position();
-        match c{
-            '\t' => {
-                self.lines[line_index].insert_str(x as usize, "    ");
-                self.cursor.set_position(x + 4, y)
-            }
-            _ => {
-                self.lines[line_index].insert(x as usize, c);
-                self.cursor.set_position(x + 1, y)
-            }
-        }
+        self.text.insert_char(c, &mut self.cursor);
+        self.cursor.change_offset();
         self.dirty = true;
     }
 
     fn new_line(&mut self) {
-        let line_index = self.cursor.get_line_index();
-        let (x, y) = self.cursor.get_position();
-        let (old, new) = self.lines[line_index].split_at(x as usize).clone();
-        let (old, new) = (String::from(old), String::from(new));
-        self.lines[line_index] = String::from(old);
-        self.lines.insert(line_index + 1, String::from(new));
-        self.cursor.set_position(0, y + 1);
+        self.text.new_line(&mut self.cursor);
+        self.cursor.change_offset();
         self.dirty = true;
     }
 
     fn delete_char(&mut self) {
-        let line_index = self.cursor.get_line_index();
-        let (x, y) = self.cursor.get_position();
-        if x > 0 {
-            self.lines[line_index].remove(x as usize - 1);
-            self.cursor.set_position(x - 1, y);
-        }else if y > 0 {
-            let current_line = self.lines[line_index].clone();
-            let old_length = self.lines[line_index - 1].len(); 
-            self.lines[line_index - 1].push_str(&current_line.as_str());
-            self.lines.remove(line_index);
-            self.cursor.set_position(old_length as u16, y-1);
-        }
+        self.text.delete_char(&mut self.cursor);
+        self.cursor.change_offset();
         self.dirty = true;
     }
 
@@ -359,7 +512,7 @@ impl Editor{
             Some(string) => string.clone(),
             None => {
                 let (x, y) = self.text_field.cursor.get_position();
-                format!("Cursor: {}, {} -- {} lines", x, y, self.text_field.lines.len())
+                format!("Cursor: {}, {} -- {} lines", x, y, self.text_field.text.len())
             }
         }
     }
