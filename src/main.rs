@@ -75,6 +75,12 @@ impl TextField {
         self.text.load(file_contents);
     }
 
+    fn reset(&mut self) {
+        self.cursor.set_position(0, 0);
+        self.dirty = false;
+        self.text.reset();
+    }
+
     fn save(&mut self, file_name: &String) -> std::io::Result<()>{
         self.text.save(file_name)?;
         self.dirty = false;
@@ -228,12 +234,12 @@ impl Editor{
         }else{
             String::with_capacity(32)
         };
-        self.file_name = prompt!(self, "Enter a path to load to:", default);
+        self.file_name = prompt!(self, "Enter a path to load from:", default);
         match &self.file_name {
             Some(name) => {
                 self.text_field.load(name)
             },
-            _ => {},
+            None => self.text_field.reset()
         }
         Ok(())
     }

@@ -445,6 +445,10 @@ impl Text{
         self.update_syntax();
     }
 
+    pub fn reset(&mut self) {
+        self.lines = vec![Line::blank()];
+    }
+
     fn update_syntax(&mut self) {
         if let Some(syntax_highlight) = &self.syntax_highlight {
             syntax_highlight.update_syntax(&mut self.lines);
